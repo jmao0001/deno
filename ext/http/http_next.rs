@@ -3770,12 +3770,12 @@ async fn wait_raw_response_ready(
 /// down right away.
 fn hand_off_connection_to_reader(
   request_body: &Rc<RawH1RequestBody<RawH1Io>>,
-  cancel: &CancelHandle,
+  connection_cancel: &CancelHandle,
 ) -> bool {
   if !request_body.reader_owns_connection() {
     return false;
   }
-  if cancel.is_canceled() {
+  if connection_cancel.is_canceled() {
     request_body.cancel();
     return false;
   }
@@ -3791,7 +3791,7 @@ async fn write_direct_response_for_reader(
   body_conn: RawNetworkH1ConnectionCell,
   request_body: Option<Rc<RawH1RequestBody<RawH1Io>>>,
   record: Rc<RawHttpRecord>,
-  cancel: Rc<CancelHandle>,
+  connection_cancel: Rc<CancelHandle>,
   version: h1::Version,
   response_context: RawH1ResponseContext,
   response_parts: RawResponseParts,
@@ -3829,7 +3829,7 @@ async fn write_direct_response_for_reader(
     }
   }
   if let Some(request_body) = request_body.as_ref()
-    && hand_off_connection_to_reader(request_body, &cancel)
+    && hand_off_connection_to_reader(request_body, &connection_cancel)
   {
     return Ok(());
   }
@@ -4533,7 +4533,8 @@ async fn serve_http11_raw(
   io: RawH1Io,
   request_info: HttpConnectionProperties,
   callback: Rc<ServerCallback>,
-  cancel: Rc<CancelHandle>,
+  listen_cancel: Rc<CancelHandle>,
+  connection_cancel: Rc<CancelHandle>,
   server_state: SignallingRc<HttpServerState>,
   automatic_compression: bool,
 ) -> Result<(), HttpNextError> {
@@ -4547,7 +4548,7 @@ async fn serve_http11_raw(
         raw_request_from_h1(request, store_request, automatic_compression)
       })
     })
-    .or_cancel(cancel.clone())
+    .or_cancel(listen_cancel.clone())
     .await;
     let Some(parsed) = (match next_request {
       Ok(Ok(result)) => result,
@@ -4642,7 +4643,7 @@ async fn serve_http11_raw(
         record_cancel_guard.disarm();
         if response_status == StatusCode::SWITCHING_PROTOCOLS.as_u16()
           || !keep_alive
-          || cancel.is_canceled()
+          || listen_cancel.is_canceled()
         {
           return Ok(());
         }
@@ -4695,7 +4696,7 @@ async fn serve_http11_raw(
       }
       if response_status == StatusCode::SWITCHING_PROTOCOLS.as_u16()
         || !keep_alive
-        || cancel.is_canceled()
+        || listen_cancel.is_canceled()
       {
         record_cancel_guard.disarm();
         return Ok(());
@@ -4710,7 +4711,7 @@ async fn serve_http11_raw(
         Rc::new(RawH1RequestBody::new(
           body_conn.clone(),
           parsed.request_body_len,
-          cancel.clone(),
+          connection_cancel.clone(),
         ))
       });
       let request_body_for_cancel = request_body_resource.clone();
@@ -4801,7 +4802,7 @@ async fn serve_http11_raw(
           record_cancel_guard.disarm();
           if response_status == StatusCode::SWITCHING_PROTOCOLS.as_u16()
             || !keep_alive
-            || cancel.is_canceled()
+            || listen_cancel.is_canceled()
           {
             if parsed.has_body {
               let _ = conn.discard_body_with_scratch(&mut scratch).await;
@@ -4817,7 +4818,7 @@ async fn serve_http11_raw(
             body_conn,
             request_body_for_cancel,
             record,
-            cancel,
+            connection_cancel.clone(),
             parsed.version,
             response_context,
             response_parts,
@@ -4876,7 +4877,7 @@ async fn serve_http11_raw(
           }
           conn = local_conn;
           scratch = local_scratch;
-          if !keep_alive || cancel.is_canceled() {
+          if !keep_alive || listen_cancel.is_canceled() {
             record_cancel_guard.disarm();
             return Ok(());
           }
@@ -4888,7 +4889,7 @@ async fn serve_http11_raw(
         .as_ref()
         .is_some_and(|body| body.reader_finished_for_reuse());
       let response_keep_alive =
-        keep_alive && (!parsed.has_body || request_body_finished);
+        keep_alive && !listen_cancel.is_canceled() && (!parsed.has_body || request_body_finished);
       match body {
         RawResponseBody::Flat(body) => {
           write_h1_flat_response_shared(
@@ -4936,7 +4937,7 @@ async fn serve_http11_raw(
       // `hand_off_connection_to_reader`.
       if parsed.has_body
         && let Some(request_body) = request_body_for_cancel.as_ref()
-        && hand_off_connection_to_reader(request_body, &cancel)
+        && hand_off_connection_to_reader(request_body, &connection_cancel)
       {
         record_cancel_guard.disarm();
         return Ok(());
@@ -4944,7 +4945,7 @@ async fn serve_http11_raw(
       let Some(state) = body_conn.borrow_mut().take() else {
         return Err(raw_h1_connection_closed());
       };
-      if response_keep_alive && !cancel.is_canceled() {
+      if response_keep_alive && !listen_cancel.is_canceled() {
         let Some(state) = Box::pin(drain_raw_h1_request_body(state)).await
         else {
           record_cancel_guard.disarm();
@@ -5013,7 +5014,7 @@ async fn serve_http11_raw(
         }
       }
       record_cancel_guard.disarm();
-      if !keep_alive || cancel.is_canceled() {
+      if !keep_alive || listen_cancel.is_canceled() {
         return Ok(());
       }
       continue;
@@ -5062,7 +5063,7 @@ async fn serve_http11_raw(
         }
       }
     }
-    if !keep_alive || cancel.is_canceled() {
+    if !keep_alive || listen_cancel.is_canceled() {
       record_cancel_guard.disarm();
       return Ok(());
     }
@@ -5101,29 +5102,36 @@ async fn serve_http2_autodetect(
   svc: impl HttpService<Incoming, ResBody = HttpRecordResponse> + 'static,
   request_info: HttpConnectionProperties,
   callback: Rc<ServerCallback>,
-  cancel: Rc<CancelHandle>,
+  listen_cancel: Rc<CancelHandle>,
+  connection_cancel: Rc<CancelHandle>,
   server_state: SignallingRc<HttpServerState>,
   options: Options,
 ) -> Result<(), HttpNextError> {
   let prefix = NetworkStreamPrefixCheck::new(io, HTTP2_PREFIX);
   let Some((matches, io)) = prefix
     .match_prefix_or_shutdown(
-      std::future::pending::<()>().or_cancel(cancel.clone()),
+      std::future::pending::<()>().or_cancel(listen_cancel.clone()),
     )
     .await?
   else {
     return Ok(());
   };
   if matches {
-    serve_http2_unconditional(io, svc, cancel, options.http2_builder_hook)
-      .await
-      .map_err(HttpNextError::Hyper)
+    serve_http2_unconditional(
+      io,
+      svc,
+      listen_cancel,
+      options.http2_builder_hook,
+    )
+    .await
+    .map_err(HttpNextError::Hyper)
   } else {
     serve_http11_raw(
       io,
       request_info,
       callback,
-      cancel,
+      listen_cancel,
+      connection_cancel,
       server_state,
       options.automatic_compression,
     )
@@ -5210,6 +5218,7 @@ fn serve_https(
       .await
     }
   });
+  let connection_cancel_handle_for_h1 = connection_cancel_handle.clone();
   spawn(
     async move {
       let handshake = io.handshake().await?;
@@ -5232,6 +5241,7 @@ fn serve_https(
           raw_request_info,
           raw_callback,
           listen_cancel_handle,
+          connection_cancel_handle_for_h1,
           raw_server_state,
           options.automatic_compression,
         )
@@ -5243,6 +5253,7 @@ fn serve_https(
           raw_request_info,
           raw_callback,
           listen_cancel_handle,
+          connection_cancel_handle_for_h1,
           raw_server_state,
           options,
         ))
@@ -5300,6 +5311,7 @@ fn serve_http(
       else {
         return Ok(());
       };
+      let connection_cancel_handle_for_h1 = connection_cancel_handle.clone();
       let join_handle = if matches {
         spawn(
           async move {
@@ -5322,6 +5334,7 @@ fn serve_http(
               raw_request_info,
               raw_callback,
               listen_cancel_handle,
+              connection_cancel_handle_for_h1,
               raw_server_state,
               options.automatic_compression,
             )
