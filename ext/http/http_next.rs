@@ -4611,6 +4611,7 @@ async fn serve_http11_raw(
         let (response_parts, body) =
           raw_response_from_direct_response(&record, response);
         let response_status = response_parts.status;
+        let response_keep_alive = keep_alive && !listen_cancel.is_canceled();
         match body {
           RawResponseBody::Flat(body) => {
             write_h1_flat_response(
@@ -4619,12 +4620,17 @@ async fn serve_http11_raw(
               parsed.version,
               response_parts,
               body,
-              keep_alive,
+              response_keep_alive,
               head,
             )
             .await?;
           }
           RawResponseBody::Stream(body) => {
+            let response_context = RawH1ResponseContext {
+              version: response_context.version,
+              keep_alive: response_keep_alive,
+              head: response_context.head,
+            };
             write_h1_stream_response(
               &mut conn,
               &mut scratch,
@@ -4762,7 +4768,7 @@ async fn serve_http11_raw(
         if let Some(state) = state {
           let mut local_conn = state.conn;
           let mut local_scratch = state.scratch;
-          let keep_alive = keep_alive && !parsed.has_body;
+          let keep_alive = keep_alive && !parsed.has_body && !listen_cancel.is_canceled();
           match body {
             RawResponseBody::Flat(body) => {
               write_h1_flat_response(
@@ -4984,6 +4990,7 @@ async fn serve_http11_raw(
     if let Some(response) = direct_response {
       let (response_parts, body) =
         raw_response_from_direct_response(&record, response);
+      let response_keep_alive = keep_alive && !listen_cancel.is_canceled();
       match body {
         RawResponseBody::Flat(body) => {
           write_h1_flat_response(
@@ -4992,12 +4999,17 @@ async fn serve_http11_raw(
             parsed.version,
             response_parts,
             body,
-            keep_alive,
+            response_keep_alive,
             head,
           )
           .await?;
         }
         RawResponseBody::Stream(body) => {
+          let response_context = RawH1ResponseContext {
+            version: response_context.version,
+            keep_alive: response_keep_alive,
+            head: response_context.head,
+          };
           write_h1_stream_response(
             &mut conn,
             &mut scratch,
@@ -5034,6 +5046,7 @@ async fn serve_http11_raw(
     else {
       return Ok(());
     };
+    let response_keep_alive = keep_alive && !listen_cancel.is_canceled();
     match body {
       RawResponseBody::Flat(body) => {
         write_h1_flat_response(
@@ -5042,12 +5055,17 @@ async fn serve_http11_raw(
           parsed.version,
           response_parts,
           body,
-          keep_alive,
+          response_keep_alive,
           head,
         )
         .await?;
       }
       RawResponseBody::Stream(body) => {
+        let response_context = RawH1ResponseContext {
+          version: response_context.version,
+          keep_alive: response_keep_alive,
+          head: response_context.head,
+        };
         write_h1_stream_response(
           &mut conn,
           &mut scratch,

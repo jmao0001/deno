@@ -6398,3 +6398,134 @@ Deno.test(
     assert(!output.includes("WARNED"));
   },
 );
+
+Deno.test(
+  { permissions: { net: true } },
+  async function httpServerShutdownInFlightRequestBody() {
+    const encoder = new TextEncoder();
+
+    function makeTrickleStream(): ReadableStream<Uint8Array> {
+      let interval: number;
+      return new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode('{"hello":'));
+          let count = 0;
+          interval = setInterval(() => {
+            count++;
+            if (count === 1) {
+              controller.enqueue(encoder.encode('"world"'));
+            } else if (count === 2) {
+              controller.enqueue(encoder.encode("}"));
+              clearInterval(interval);
+              controller.close();
+            }
+          }, 50);
+        },
+        cancel() {
+          clearInterval(interval);
+        },
+      });
+    }
+
+    for (const readBeforeShutdown of [true, false]) {
+      let shutdownResolved = false;
+      const server = Deno.serve(
+        { port: 0, onListen() {} },
+        async (req) => {
+          let parsed;
+          if (readBeforeShutdown) {
+            const bodyPromise = req.json();
+            server.shutdown().then(() => {
+              shutdownResolved = true;
+            });
+            parsed = await bodyPromise;
+          } else {
+            server.shutdown().then(() => {
+              shutdownResolved = true;
+            });
+            parsed = await req.json();
+          }
+          assertEquals(parsed, { hello: "world" });
+          assertEquals(shutdownResolved, false);
+          return new Response("ok");
+        },
+      );
+
+      const port = (server.addr as Deno.NetAddr).port;
+      const resp = await fetch(`http://127.0.0.1:${port}/`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: makeTrickleStream(),
+        // @ts-ignore duplex is needed for streaming body in fetch
+        duplex: "half",
+      });
+
+      assertEquals(resp.status, 200);
+      assertEquals(await resp.text(), "ok");
+      await server.finished;
+      assertEquals(shutdownResolved, true);
+    }
+  },
+);
+
+Deno.test(
+  { permissions: { net: true } },
+  async function httpServerShutdownInFlightStreamReader() {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+
+    let closeStream!: () => void;
+    let enqueueChunk!: (chunk: Uint8Array) => void;
+    const clientStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        enqueueChunk = (chunk) => controller.enqueue(chunk);
+        closeStream = () => controller.close();
+      },
+    });
+
+    let shutdownResolved = false;
+    const server = Deno.serve(
+      { port: 0, onListen() {} },
+      async (req) => {
+        const reader = req.body!.getReader();
+        const first = await reader.read();
+        assertEquals(first.done, false);
+        assertEquals(decoder.decode(first.value), "chunk1");
+
+        server.shutdown().then(() => {
+          shutdownResolved = true;
+        });
+
+        const second = await reader.read();
+        assertEquals(second.done, false);
+        assertEquals(decoder.decode(second.value), "chunk2");
+
+        const third = await reader.read();
+        assertEquals(third.done, true);
+        assertEquals(shutdownResolved, false);
+
+        return new Response("stream-ok");
+      },
+    );
+
+    const port = (server.addr as Deno.NetAddr).port;
+    const fetchPromise = fetch(`http://127.0.0.1:${port}/`, {
+      method: "POST",
+      body: clientStream,
+      // @ts-ignore duplex is needed for streaming body in fetch
+      duplex: "half",
+    });
+
+    enqueueChunk(encoder.encode("chunk1"));
+    await delay(50);
+    enqueueChunk(encoder.encode("chunk2"));
+    await delay(50);
+    closeStream();
+
+    const resp = await fetchPromise;
+    assertEquals(resp.status, 200);
+    assertEquals(await resp.text(), "stream-ok");
+    await server.finished;
+    assertEquals(shutdownResolved, true);
+  },
+);
